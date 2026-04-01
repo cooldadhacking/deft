@@ -1,0 +1,47 @@
+{
+  "timing": {
+    "tap_ms": 150,
+    "hold_ms": 250,
+    "chord_ms": 120
+  },
+  "builtin_keyboard_only": true,
+  "left_home_row": [
+    { "key": "A", "modifier": "Command" },
+    { "key": "S", "modifier": "Option" },
+    { "key": "D", "modifier": "Control" },
+    { "key": "F", "modifier": "Shift" }
+  ],
+  "right_home_row": [
+    { "key": "J", "modifier": "Shift" },
+    { "key": "K", "modifier": "Control" },
+    { "key": "L", "modifier": "Option" },
+    { "key": "Semicolon", "modifier": "Command" }
+  ],
+  "space_layer": [
+    { "from": "H", "to": "LeftArrow" },
+    { "from": "J", "to": "DownArrow" },
+    { "from": "K", "to": "UpArrow" },
+    { "from": "L", "to": "RightArrow" }
+  ],
+  "extra_tap_holds": [
+    {
+      "key": "Tab",
+      "tap": "Tab",
+      "hold": "Hyper"
+    }
+  ],
+  "combos": [
+    { "key1": "J", "key2": "K", "output": "Escape" }
+  ],
+  "simple_remaps": [
+    { "from": "RightShift", "to": "Space" }
+  ],
+  "profiles": {
+    "fps": { "tap_hold": false, "combos": false, "space_layer": false },
+    "mmo": { "tap_hold": false, "combos": true, "space_layer": false }
+  },
+  "app_profiles": {
+    "com.riotgames.LeagueOfLegends.GameClient": "fps",
+    "com.blizzard.worldofwarcraft": "mmo"
+  }
+}

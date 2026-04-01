@@ -1,0 +1,7 @@
+zig-out/
+.zig-cache/
+*.o
+*.a
+*.so
+*.dylib
+.DS_Store
