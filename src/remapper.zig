@@ -6,6 +6,13 @@ const Config = config.Config;
 const Key = config.Key;
 const Modifier = config.Modifier;
 
+/// Monotonic clock in nanoseconds (std.time.nanoTimestamp was removed in Zig 0.16).
+pub fn nanoTimestamp() i128 {
+    var ts: std.c.timespec = undefined;
+    _ = std.c.clock_gettime(.MONOTONIC, &ts);
+    return @as(i128, ts.sec) * std.time.ns_per_s + ts.nsec;
+}
+
 const KeyState = union(enum) {
     Idle,
     Down: i128, // Timestamp in nanoseconds
@@ -19,8 +26,7 @@ pub const RemapAction = union(enum) {
     Suppress,
     ReplaceWithKey: Key,
     ApplyModifiers: []const Modifier,
-    EmitPendingThenPassThrough: Key,
-    EmitPendingThenApplyModifiers: struct { pending_key: Key, modifiers: []const Modifier },
+    ReplaceWithKeyAndModifiers: struct { key: Key, modifiers: []const Modifier },
 };
 
 const TapHoldInfo = struct {
@@ -33,20 +39,32 @@ pub const RemapperState = struct {
     key_states: std.AutoHashMap(Key, KeyState),
     space_layer_active: bool,
     active_modifiers: std.ArrayList(Modifier),
-    pending_tap: ?struct { key: Key, time: i128 },
     allocator: std.mem.Allocator,
     active_profile: config.Profile,
+    // Taps flushed by fast-roll detection, waiting to be emitted before the
+    // key event that triggered the flush. Drained via takePendingRolls().
+    roll_buf: [8]Key,
+    roll_len: usize,
 
     pub fn init(allocator: std.mem.Allocator, cfg: Config) !RemapperState {
         return .{
             .config = cfg,
             .key_states = std.AutoHashMap(Key, KeyState).init(allocator),
             .space_layer_active = false,
-            .active_modifiers = .{},
-            .pending_tap = null,
+            .active_modifiers = .empty,
             .allocator = allocator,
             .active_profile = .{},
+            .roll_buf = undefined,
+            .roll_len = 0,
         };
+    }
+
+    /// Returns taps buffered by roll detection and clears the buffer.
+    /// The caller must emit these before acting on the current key event.
+    pub fn takePendingRolls(self: *RemapperState) []const Key {
+        const n = self.roll_len;
+        self.roll_len = 0;
+        return self.roll_buf[0..n];
     }
 
     pub fn deinit(self: *RemapperState) void {
@@ -118,7 +136,7 @@ pub const RemapperState = struct {
         // --- Combo check (only when combos enabled) ---
         if (profile.combos) {
             if (key_opt) |k| {
-                const now = std.time.nanoTimestamp();
+                const now = nanoTimestamp();
                 if (self.checkCombos(k, now)) |combo_output| {
                     std.debug.print("Combo fired! {s} + another key -> {s}\n", .{ @tagName(k), @tagName(combo_output) });
                     for (self.config.combos) |combo| {
@@ -168,7 +186,7 @@ pub const RemapperState = struct {
                         }
                     }
 
-                    try self.key_states.put(.Space, .{ .Down = std.time.nanoTimestamp() });
+                    try self.key_states.put(.Space, .{ .Down = nanoTimestamp() });
                     self.space_layer_active = true;
                     std.debug.print("Space layer activated\n", .{});
                     return .Suppress;
@@ -177,8 +195,8 @@ pub const RemapperState = struct {
                 if (self.space_layer_active) {
                     for (self.config.space_layer) |mapping| {
                         if (k == mapping.from) {
-                            std.debug.print("Space layer mapping: {s} -> {s}\n", .{ @tagName(k), @tagName(mapping.to) });
-                            return .{ .ReplaceWithKey = mapping.to };
+                            std.debug.print("Space layer mapping: {s} -> {s} (modifiers: {any})\n", .{ @tagName(k), @tagName(mapping.to), self.active_modifiers.items });
+                            return .{ .ReplaceWithKeyAndModifiers = .{ .key = mapping.to, .modifiers = self.active_modifiers.items } };
                         }
                     }
                 }
@@ -199,7 +217,7 @@ pub const RemapperState = struct {
                             }
                         }
                         std.debug.print("Combo key (tap_hold off): {s}, marking as down\n", .{@tagName(k)});
-                        try self.key_states.put(k, .{ .Down = std.time.nanoTimestamp() });
+                        try self.key_states.put(k, .{ .Down = nanoTimestamp() });
                         return .Suppress;
                     }
                     // Pass through instantly — no modifier, no suppression
@@ -224,7 +242,7 @@ pub const RemapperState = struct {
                 }
 
                 std.debug.print("Home row key detected: {s}, marking as down\n", .{@tagName(k)});
-                try self.key_states.put(k, .{ .Down = std.time.nanoTimestamp() });
+                try self.key_states.put(k, .{ .Down = nanoTimestamp() });
                 return .Suppress;
             }
 
@@ -247,7 +265,7 @@ pub const RemapperState = struct {
                 }
 
                 std.debug.print("Combo key detected: {s}, marking as down\n", .{@tagName(k)});
-                try self.key_states.put(k, .{ .Down = std.time.nanoTimestamp() });
+                try self.key_states.put(k, .{ .Down = nanoTimestamp() });
                 return .Suppress;
             }
         }
@@ -279,7 +297,7 @@ pub const RemapperState = struct {
 
             if (self.key_states.get(key)) |state| {
                 if (state == .Down) {
-                    const elapsed_ns = std.time.nanoTimestamp() - state.Down;
+                    const elapsed_ns = nanoTimestamp() - state.Down;
                     const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
                     std.debug.print("Space held for {d}ms\n", .{elapsed_ms});
 
@@ -347,7 +365,7 @@ pub const RemapperState = struct {
                         return .Suppress;
                     },
                     .Down => |down_time| {
-                        const elapsed_ns = std.time.nanoTimestamp() - down_time;
+                        const elapsed_ns = nanoTimestamp() - down_time;
                         const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
                         std.debug.print("Home row key {s} was held for {d}ms\n", .{ @tagName(key), elapsed_ms });
 
@@ -376,7 +394,7 @@ pub const RemapperState = struct {
 
             if (self.key_states.get(key)) |state| {
                 if (state == .Down) {
-                    const elapsed_ns = std.time.nanoTimestamp() - state.Down;
+                    const elapsed_ns = nanoTimestamp() - state.Down;
                     const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
                     std.debug.print("Combo-only key {s} released after {d}ms\n", .{ @tagName(key), elapsed_ms });
 
@@ -394,80 +412,62 @@ pub const RemapperState = struct {
         return .PassThrough;
     }
 
+    const RollEntry = struct { key: Key, time: i128 };
+
+    /// Decide what a currently-down tap-hold key means now that another key
+    /// has been pressed: held at least chord_ms -> it's a chord, activate the
+    /// modifier; younger than that -> it's a fast typing roll, flush its tap.
+    /// With the space layer active a chord is always intended, so no roll check.
+    fn considerChordKey(self: *RemapperState, state_key: Key, tap_out: Key, hold: Modifier, now: i128, rolls: *[8]RollEntry, roll_len: *usize, activated: *usize) !void {
+        const state = self.key_states.get(state_key) orelse return;
+        if (state != .Down) return;
+        const down_time = state.Down;
+        const elapsed_ms = @divTrunc(now - down_time, std.time.ns_per_ms);
+
+        if (elapsed_ms < self.config.timing.chord_ms and !self.space_layer_active and roll_len.* < rolls.len) {
+            std.debug.print("Roll detected: {s} down only {d}ms, flushing as tap\n", .{ @tagName(state_key), elapsed_ms });
+            try self.key_states.put(state_key, .Tapped);
+            rolls[roll_len.*] = .{ .key = tap_out, .time = down_time };
+            roll_len.* += 1;
+            return;
+        }
+
+        std.debug.print("Chord detected! Activating {s} as modifier after {d}ms\n", .{ @tagName(state_key), elapsed_ms });
+        try self.key_states.put(state_key, .Held);
+        activated.* += 1;
+        for (self.active_modifiers.items) |m| {
+            if (m == hold) return;
+        }
+        try self.active_modifiers.append(self.allocator, hold);
+    }
+
     fn checkAndActivateChords(self: *RemapperState) !usize {
         var activated_count: usize = 0;
+        var rolls: [8]RollEntry = undefined;
+        var roll_len: usize = 0;
 
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
 
         for (self.config.left_home_row) |hrk| {
-            if (self.key_states.get(hrk.tap)) |state| {
-                if (state == .Down) {
-                    const elapsed_ns = now - state.Down;
-                    const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
-                    std.debug.print("Chord detected! Activating {s} as modifier after {d}ms\n", .{ @tagName(hrk.tap), elapsed_ms });
-                    try self.key_states.put(hrk.tap, .Held);
-
-                    var found = false;
-                    for (self.active_modifiers.items) |m| {
-                        if (m == hrk.hold) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        try self.active_modifiers.append(self.allocator, hrk.hold);
-                    }
-                    activated_count += 1;
-                }
-            }
+            try self.considerChordKey(hrk.tap, hrk.tap, hrk.hold, now, &rolls, &roll_len, &activated_count);
         }
-
         for (self.config.right_home_row) |hrk| {
-            if (self.key_states.get(hrk.tap)) |state| {
-                if (state == .Down) {
-                    const elapsed_ns = now - state.Down;
-                    const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
-                    std.debug.print("Chord detected! Activating {s} as modifier after {d}ms\n", .{ @tagName(hrk.tap), elapsed_ms });
-                    try self.key_states.put(hrk.tap, .Held);
-
-                    var found = false;
-                    for (self.active_modifiers.items) |m| {
-                        if (m == hrk.hold) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        try self.active_modifiers.append(self.allocator, hrk.hold);
-                    }
-                    activated_count += 1;
-                }
-            }
+            try self.considerChordKey(hrk.tap, hrk.tap, hrk.hold, now, &rolls, &roll_len, &activated_count);
         }
-
-        // Check extra tap-hold keys for chords
         for (self.config.extra_tap_holds) |eth| {
-            if (self.key_states.get(eth.key)) |state| {
-                if (state == .Down) {
-                    const elapsed_ns = now - state.Down;
-                    const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
-                    std.debug.print("Chord detected! Activating {s} as modifier after {d}ms\n", .{ @tagName(eth.key), elapsed_ms });
-                    try self.key_states.put(eth.key, .Held);
-
-                    var found = false;
-                    for (self.active_modifiers.items) |m| {
-                        if (m == eth.hold) {
-                            found = true;
-                            break;
-                        }
-                    }
-                    if (!found) {
-                        try self.active_modifiers.append(self.allocator, eth.hold);
-                    }
-                    activated_count += 1;
-                }
-            }
+            try self.considerChordKey(eth.key, eth.tap, eth.hold, now, &rolls, &roll_len, &activated_count);
         }
+
+        // Buffer rolled taps in press order for the caller to emit.
+        std.mem.sort(RollEntry, rolls[0..roll_len], {}, struct {
+            fn lessThan(_: void, a: RollEntry, b: RollEntry) bool {
+                return a.time < b.time;
+            }
+        }.lessThan);
+        for (rolls[0..roll_len], 0..) |entry, i| {
+            self.roll_buf[i] = entry.key;
+        }
+        self.roll_len = roll_len;
 
         return activated_count;
     }
@@ -477,7 +477,7 @@ pub const RemapperState = struct {
 
         std.debug.print("updateHeldModifiers called, checking key states...\n", .{});
 
-        const now = std.time.nanoTimestamp();
+        const now = nanoTimestamp();
 
         for (self.config.left_home_row) |hrk| {
             if (self.key_states.get(hrk.tap)) |state| {

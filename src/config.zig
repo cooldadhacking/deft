@@ -201,15 +201,9 @@ pub const Config = struct {
         };
     }
 
-    pub fn loadFromFile(allocator: std.mem.Allocator, path: []const u8) !Config {
-        const file = std.fs.cwd().openFile(path, .{}) catch |err| {
-            std.debug.print("Could not open config file '{s}': {}, using defaults\n", .{ path, err });
-            return default();
-        };
-        defer file.close();
-
-        const content = file.readToEndAlloc(allocator, 1024 * 1024) catch |err| {
-            std.debug.print("Could not read config file: {}, using defaults\n", .{err});
+    pub fn loadFromFile(allocator: std.mem.Allocator, io: std.Io, path: []const u8) !Config {
+        const content = std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024)) catch |err| {
+            std.debug.print("Could not read config file '{s}': {}, using defaults\n", .{ path, err });
             return default();
         };
         defer allocator.free(content);

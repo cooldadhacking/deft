@@ -3,22 +3,95 @@ const config = @import("config.zig");
 const keycode = @import("keycode.zig");
 const remapper = @import("remapper.zig");
 
-// Import Core Graphics, Core Foundation, and Objective-C runtime C APIs
+// Import Core Foundation and Objective-C runtime C APIs
 const c = @cImport({
-    @cInclude("CoreGraphics/CoreGraphics.h");
     @cInclude("CoreFoundation/CoreFoundation.h");
     @cInclude("objc/runtime.h");
     @cInclude("objc/message.h");
-    @cInclude("IOKit/hid/IOHIDDevice.h");
-    @cInclude("IOKit/hid/IOHIDManager.h");
 });
+
+// CoreGraphics event-tap and IOKit HID APIs, declared by hand: recent SDK
+// headers for these frameworks use blocks (`^`) and nullability annotations
+// on array parameters, which Zig 0.16's translate-c cannot parse.
+const cg = struct {
+    pub const CGEvent = opaque {};
+    pub const CGEventRef = ?*CGEvent;
+    pub const CGEventSource = opaque {};
+    pub const CGEventSourceRef = ?*CGEventSource;
+    pub const CGEventTapProxy = ?*anyopaque;
+    pub const CGEventType = u32;
+    pub const CGEventMask = u64;
+    pub const CGEventFlags = u64;
+    pub const CGKeyCode = u16;
+    pub const CGEventField = u32;
+    pub const CGEventSourceStateID = i32;
+    pub const CGPoint = extern struct { x: f64, y: f64 };
+    pub const CGEventTapCallBack = *const fn (CGEventTapProxy, CGEventType, CGEventRef, ?*anyopaque) callconv(.c) CGEventRef;
+
+    // CGEventTypes.h (values shared with IOLLEvent.h NX_* constants)
+    pub const kCGEventLeftMouseDown: CGEventType = 1;
+    pub const kCGEventLeftMouseUp: CGEventType = 2;
+    pub const kCGEventRightMouseDown: CGEventType = 3;
+    pub const kCGEventRightMouseUp: CGEventType = 4;
+    pub const kCGEventMouseMoved: CGEventType = 5;
+    pub const kCGEventKeyDown: CGEventType = 10;
+    pub const kCGEventKeyUp: CGEventType = 11;
+    pub const kCGEventFlagsChanged: CGEventType = 12;
+    pub const kCGEventTapDisabledByTimeout: CGEventType = 0xFFFFFFFE;
+    pub const kCGEventTapDisabledByUserInput: CGEventType = 0xFFFFFFFF;
+
+    pub const kCGKeyboardEventKeycode: CGEventField = 9;
+    pub const kCGKeyboardEventKeyboardType: CGEventField = 10;
+
+    pub const kCGHIDEventTap: u32 = 0; // CGEventTapLocation
+    pub const kCGSessionEventTap: u32 = 1;
+    pub const kCGHeadInsertEventTap: u32 = 0; // CGEventTapPlacement
+    pub const kCGEventTapOptionDefault: u32 = 0; // CGEventTapOptions
+    pub const kCGMouseButtonLeft: u32 = 0;
+    pub const kCGMouseButtonRight: u32 = 1;
+    pub const kCGEventSourceStateHIDSystemState: CGEventSourceStateID = 1;
+
+    pub extern "c" fn CGEventTapCreate(tap: u32, place: u32, options: u32, events_of_interest: CGEventMask, callback: CGEventTapCallBack, user_info: ?*anyopaque) c.CFMachPortRef;
+    pub extern "c" fn CGEventTapEnable(tap: c.CFMachPortRef, enable: bool) void;
+    pub extern "c" fn CGEventGetIntegerValueField(event: CGEventRef, field: CGEventField) i64;
+    pub extern "c" fn CGEventSetIntegerValueField(event: CGEventRef, field: CGEventField, value: i64) void;
+    pub extern "c" fn CGEventGetFlags(event: CGEventRef) CGEventFlags;
+    pub extern "c" fn CGEventSetFlags(event: CGEventRef, flags: CGEventFlags) void;
+    pub extern "c" fn CGEventCreate(source: CGEventSourceRef) CGEventRef;
+    pub extern "c" fn CGEventCreateKeyboardEvent(source: CGEventSourceRef, virtual_key: CGKeyCode, key_down: bool) CGEventRef;
+    pub extern "c" fn CGEventCreateMouseEvent(source: CGEventSourceRef, mouse_type: CGEventType, position: CGPoint, button: u32) CGEventRef;
+    pub extern "c" fn CGEventGetLocation(event: CGEventRef) CGPoint;
+    pub extern "c" fn CGEventPost(tap: u32, event: CGEventRef) void;
+    pub extern "c" fn CGEventSourceCreate(state_id: CGEventSourceStateID) CGEventSourceRef;
+
+    // IOKit/hid (IOHIDManager.h, IOHIDDeviceKeys.h)
+    pub const IOHIDManager = opaque {};
+    pub const IOHIDManagerRef = ?*IOHIDManager;
+    pub const IOHIDDevice = opaque {};
+    pub const IOHIDDeviceRef = ?*IOHIDDevice;
+    pub const IOReturn = c_int;
+    pub const kIOReturnSuccess: IOReturn = 0;
+    pub const kIOHIDOptionsTypeNone: u32 = 0;
+    pub const kIOHIDTransportKey = "Transport";
+    pub const kIOHIDVendorIDKey = "VendorID";
+    pub const kIOHIDProductKey = "Product";
+    pub const kIOHIDDeviceUsageKey = "DeviceUsage";
+    pub const kIOHIDDeviceUsagePageKey = "DeviceUsagePage";
+
+    pub extern "c" fn IOHIDManagerCreate(allocator: c.CFAllocatorRef, options: u32) IOHIDManagerRef;
+    pub extern "c" fn IOHIDManagerSetDeviceMatching(manager: IOHIDManagerRef, matching: c.CFDictionaryRef) void;
+    pub extern "c" fn IOHIDManagerOpen(manager: IOHIDManagerRef, options: u32) IOReturn;
+    pub extern "c" fn IOHIDManagerClose(manager: IOHIDManagerRef, options: u32) IOReturn;
+    pub extern "c" fn IOHIDManagerCopyDevices(manager: IOHIDManagerRef) c.CFSetRef;
+    pub extern "c" fn IOHIDDeviceGetProperty(device: IOHIDDeviceRef, key: c.CFStringRef) c.CFTypeRef;
+};
 
 const Config = config.Config;
 const Key = config.Key;
 const RemapperState = remapper.RemapperState;
 const RemapAction = remapper.RemapAction;
 
-const KEYCODE_DELETE: c.CGKeyCode = 51; // Backspace/Delete key
+const KEYCODE_DELETE: cg.CGKeyCode = 51; // Backspace/Delete key
 
 // Declare AppKit / ApplicationServices functions
 extern "c" fn NSApplicationLoad() c_int;
@@ -97,6 +170,7 @@ fn msgSend_void_ptr_sel_ptr_ptr(target: *anyopaque, sel: ?*c.struct_objc_selecto
 // Global state for the event callback
 var global_remapper: *RemapperState = undefined;
 var global_allocator: std.mem.Allocator = undefined;
+var global_io: std.Io = undefined;
 var global_app: ?*anyopaque = null;
 var global_status_item: ?*anyopaque = null;
 var global_delegate: ?*anyopaque = null;
@@ -106,6 +180,8 @@ var global_enabled: bool = true;
 var global_enabled_item: ?*anyopaque = null;
 var global_config: ?*Config = null;
 var global_event_tap_active: bool = false;
+var global_event_tap: c.CFMachPortRef = null;
+var global_permission_timer: c.CFRunLoopTimerRef = null;
 var global_accessibility_item: ?*anyopaque = null;
 var global_input_monitoring_item: ?*anyopaque = null;
 var global_config_path_buf: [std.fs.max_path_bytes]u8 = undefined;
@@ -140,29 +216,32 @@ const MouseMoveState = struct {
 };
 var mouse_move_state = MouseMoveState{};
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
     global_allocator = allocator;
+    global_io = init.io;
 
     const cfg = try allocator.create(Config);
 
     // Resolve config path: ~/.config/deft/config.json first, then ./config.json
     const config_file = blk: {
-        if (std.posix.getenv("HOME")) |home| {
+        if (std.c.getenv("HOME")) |home_z| {
+            const home = std.mem.sliceTo(home_z, 0);
             const xdg_path = std.fmt.bufPrint(&global_config_path_buf, "{s}/.config/deft/config.json", .{home}) catch break :blk "config.json";
-            if (std.fs.cwd().access(xdg_path, .{})) |_| {
+            if (std.Io.Dir.cwd().access(global_io, xdg_path, .{})) |_| {
                 global_config_path = xdg_path;
                 break :blk xdg_path;
             } else |_| {}
         }
         // Fall back to ./config.json
-        global_config_path = std.fs.cwd().realpath("config.json", &global_config_path_buf) catch null;
+        global_config_path = if (std.c.realpath("config.json", &global_config_path_buf)) |p|
+            std.mem.sliceTo(p, 0)
+        else
+            null;
         break :blk global_config_path orelse "config.json";
     };
 
-    cfg.* = try Config.loadFromFile(allocator, config_file);
+    cfg.* = try Config.loadFromFile(allocator, global_io, config_file);
     global_config = cfg;
 
     global_builtin_keyboard_only = cfg.builtin_keyboard_only;
@@ -183,10 +262,8 @@ pub fn main() !void {
 
     // Check for --headless flag
     const headless = blk: {
-        var args = std.process.args();
-        _ = args.next(); // skip argv[0]
-        while (args.next()) |arg| {
-            if (std.mem.eql(u8, arg, "--headless")) break :blk true;
+        for (init.minimal.args.vector[1..]) |arg_z| {
+            if (std.mem.eql(u8, std.mem.sliceTo(arg_z, 0), "--headless")) break :blk true;
         }
         break :blk false;
     };
@@ -275,7 +352,7 @@ fn createMenuBar() void {
     };
 
     if (!icon_set) {
-        const title_cstr: [*:0]const u8 = "⌨︎";
+        const title_cstr: [*:0]const u8 = "d";
         const title = msgSend_ptr_cstr(NSString_class, c.sel_registerName("stringWithUTF8String:"), title_cstr);
         msgSend_void_ptr(button, c.sel_registerName("setTitle:"), title);
     }
@@ -555,7 +632,7 @@ fn reloadConfigHandler(_: *anyopaque, _: *anyopaque, _: *anyopaque) callconv(.c)
         return;
     };
     const config_file = global_config_path orelse "config.json";
-    new_cfg.* = Config.loadFromFile(allocator, config_file) catch |err| {
+    new_cfg.* = Config.loadFromFile(allocator, global_io, config_file) catch |err| {
         std.debug.print("Failed to load config: {}\n", .{err});
         allocator.destroy(new_cfg);
         return;
@@ -859,7 +936,7 @@ fn cfStr(comptime s: []const u8) c.CFStringRef {
 }
 
 fn detectBuiltinKeyboardType() void {
-    const manager = c.IOHIDManagerCreate(c.kCFAllocatorDefault, c.kIOHIDOptionsTypeNone);
+    const manager = cg.IOHIDManagerCreate(c.kCFAllocatorDefault, cg.kIOHIDOptionsTypeNone);
     if (manager == null) {
         std.debug.print("Could not create IOHIDManager, processing all keyboards\n", .{});
         global_builtin_kb_type = null;
@@ -868,9 +945,9 @@ fn detectBuiltinKeyboardType() void {
     defer c.CFRelease(manager);
 
     // Build matching dictionary: UsagePage=1 (Generic Desktop), Usage=6 (Keyboard)
-    const usage_page_key = cfStr(c.kIOHIDDeviceUsagePageKey);
+    const usage_page_key = cfStr(cg.kIOHIDDeviceUsagePageKey);
     defer c.CFRelease(usage_page_key);
-    const usage_key = cfStr(c.kIOHIDDeviceUsageKey);
+    const usage_key = cfStr(cg.kIOHIDDeviceUsageKey);
     defer c.CFRelease(usage_key);
 
     var page_val: c_int = 1; // kHIDPage_GenericDesktop
@@ -892,16 +969,16 @@ fn detectBuiltinKeyboardType() void {
     );
     defer c.CFRelease(match_dict);
 
-    c.IOHIDManagerSetDeviceMatching(manager, match_dict);
+    cg.IOHIDManagerSetDeviceMatching(manager, match_dict);
 
-    if (c.IOHIDManagerOpen(manager, c.kIOHIDOptionsTypeNone) != c.kIOReturnSuccess) {
+    if (cg.IOHIDManagerOpen(manager, cg.kIOHIDOptionsTypeNone) != cg.kIOReturnSuccess) {
         std.debug.print("Could not open IOHIDManager, processing all keyboards\n", .{});
         global_builtin_kb_type = null;
         return;
     }
-    defer _ = c.IOHIDManagerClose(manager, c.kIOHIDOptionsTypeNone);
+    defer _ = cg.IOHIDManagerClose(manager, cg.kIOHIDOptionsTypeNone);
 
-    const device_set = c.IOHIDManagerCopyDevices(manager);
+    const device_set = cg.IOHIDManagerCopyDevices(manager);
     if (device_set == null) {
         std.debug.print("No HID keyboard devices found, processing all keyboards\n", .{});
         global_builtin_kb_type = null;
@@ -921,20 +998,20 @@ fn detectBuiltinKeyboardType() void {
     const actual_count: usize = @intCast(@min(count, 64));
     c.CFSetGetValues(device_set, &devices_buf);
 
-    const vendor_key = cfStr(c.kIOHIDVendorIDKey);
+    const vendor_key = cfStr(cg.kIOHIDVendorIDKey);
     defer c.CFRelease(vendor_key);
-    const transport_key = cfStr(c.kIOHIDTransportKey);
+    const transport_key = cfStr(cg.kIOHIDTransportKey);
     defer c.CFRelease(transport_key);
-    const product_key = cfStr(c.kIOHIDProductKey);
+    const product_key = cfStr(cg.kIOHIDProductKey);
     defer c.CFRelease(product_key);
     const kb_type_key = cfStr("KeyboardType");
     defer c.CFRelease(kb_type_key);
 
     for (devices_buf[0..actual_count]) |dev_ptr| {
-        const device: c.IOHIDDeviceRef = @ptrCast(@constCast(dev_ptr));
+        const device: cg.IOHIDDeviceRef = @ptrCast(@constCast(dev_ptr));
 
         // Check vendor ID == 0x05AC (Apple)
-        const vendor_ref = c.IOHIDDeviceGetProperty(device, vendor_key);
+        const vendor_ref = cg.IOHIDDeviceGetProperty(device, vendor_key);
         if (vendor_ref == null) continue;
         var vendor_id: c_int = 0;
         if (c.CFNumberGetValue(@ptrCast(vendor_ref), c.kCFNumberIntType, &vendor_id) == 0) continue;
@@ -942,7 +1019,7 @@ fn detectBuiltinKeyboardType() void {
 
         // Check transport == "SPI" (Apple Silicon built-in bus)
         var is_builtin = false;
-        const transport_ref = c.IOHIDDeviceGetProperty(device, transport_key);
+        const transport_ref = cg.IOHIDDeviceGetProperty(device, transport_key);
         if (transport_ref != null) {
             const transport_cfstr: c.CFStringRef = @ptrCast(transport_ref);
             const spi_str = cfStr("SPI");
@@ -954,7 +1031,7 @@ fn detectBuiltinKeyboardType() void {
 
         // Fallback: check product name contains "Internal" (Intel Macs)
         if (!is_builtin) {
-            const product_ref = c.IOHIDDeviceGetProperty(device, product_key);
+            const product_ref = cg.IOHIDDeviceGetProperty(device, product_key);
             if (product_ref != null) {
                 const product_cfstr: c.CFStringRef = @ptrCast(product_ref);
                 const internal_str = cfStr("Internal");
@@ -969,7 +1046,7 @@ fn detectBuiltinKeyboardType() void {
         if (!is_builtin) continue;
 
         // Read KeyboardType property
-        const kb_type_ref = c.IOHIDDeviceGetProperty(device, kb_type_key);
+        const kb_type_ref = cg.IOHIDDeviceGetProperty(device, kb_type_key);
         if (kb_type_ref == null) continue;
         var kb_type_val: i64 = 0;
         if (c.CFNumberGetValue(@ptrCast(kb_type_ref), c.kCFNumberSInt64Type, &kb_type_val) == 0) continue;
@@ -988,63 +1065,119 @@ fn startEventTap() void {
 
     std.debug.print("Creating event tap...\n", .{});
 
-    const event_mask: c.CGEventMask = (1 << c.kCGEventKeyDown) | (1 << c.kCGEventKeyUp) | (1 << c.kCGEventFlagsChanged);
+    const event_mask: cg.CGEventMask = (1 << cg.kCGEventKeyDown) | (1 << cg.kCGEventKeyUp) | (1 << cg.kCGEventFlagsChanged);
 
-    const tap = c.CGEventTapCreate(
-        c.kCGHIDEventTap,
-        c.kCGHeadInsertEventTap,
-        c.kCGEventTapOptionDefault,
+    const tap = cg.CGEventTapCreate(
+        cg.kCGHIDEventTap,
+        cg.kCGHeadInsertEventTap,
+        cg.kCGEventTapOptionDefault,
         event_mask,
         eventCallback,
         null,
     );
 
     if (tap == null) {
-        std.debug.print("Event tap failed — grant Accessibility and Input Monitoring permissions, then click Enabled.\n", .{});
+        std.debug.print("Event tap failed — waiting for Accessibility and Input Monitoring permissions...\n", .{});
+        startPermissionRetryTimer();
         return;
     }
 
     const run_loop_source = c.CFMachPortCreateRunLoopSource(c.kCFAllocatorDefault, tap, 0);
     c.CFRunLoopAddSource(c.CFRunLoopGetCurrent(), run_loop_source, c.kCFRunLoopCommonModes);
-    c.CGEventTapEnable(tap, true);
-    // Release our references — the run loop retains what it needs
+    cg.CGEventTapEnable(tap, true);
+    // Release the source — the run loop retains it. Keep the tap so we can
+    // re-enable it when the system disables it (see eventCallbackInternal).
     c.CFRelease(run_loop_source);
-    c.CFRelease(tap);
+    global_event_tap = tap;
 
     global_event_tap_active = true;
     std.debug.print("Event tap created successfully!\n", .{});
 }
 
+/// While permissions are missing, retry the event tap every few seconds so
+/// deft starts working the moment the user grants them — no manual toggle.
+fn startPermissionRetryTimer() void {
+    if (global_permission_timer != null) return;
+
+    const timer = c.CFRunLoopTimerCreate(
+        c.kCFAllocatorDefault,
+        c.CFAbsoluteTimeGetCurrent() + 3.0,
+        3.0,
+        0,
+        0,
+        permissionRetryCallback,
+        null,
+    );
+    if (timer != null) {
+        c.CFRunLoopAddTimer(c.CFRunLoopGetCurrent(), timer, c.kCFRunLoopCommonModes);
+        global_permission_timer = timer;
+        std.debug.print("Watching for permission grant...\n", .{});
+    }
+}
+
+fn stopPermissionRetryTimer() void {
+    if (global_permission_timer) |timer| {
+        c.CFRunLoopTimerInvalidate(timer);
+        c.CFRelease(timer);
+        global_permission_timer = null;
+    }
+}
+
+fn permissionRetryCallback(_: c.CFRunLoopTimerRef, _: ?*anyopaque) callconv(.c) void {
+    if (global_event_tap_active) {
+        stopPermissionRetryTimer();
+        return;
+    }
+
+    startEventTap();
+    if (global_event_tap_active) {
+        global_enabled = true;
+        updateEnabledItemTitle();
+        std.debug.print("Permissions granted — remapping is now active\n", .{});
+        stopPermissionRetryTimer();
+    }
+}
+
 fn eventCallback(
-    _: c.CGEventTapProxy,
-    event_type: c.CGEventType,
-    event: c.CGEventRef,
+    _: cg.CGEventTapProxy,
+    event_type: cg.CGEventType,
+    event: cg.CGEventRef,
     _: ?*anyopaque,
-) callconv(.c) c.CGEventRef {
+) callconv(.c) cg.CGEventRef {
     const result = eventCallbackInternal(event_type, event);
     return result orelse @ptrFromInt(0);
 }
 
-fn eventCallbackInternal(event_type: c.CGEventType, event: c.CGEventRef) ?c.CGEventRef {
+fn eventCallbackInternal(event_type: cg.CGEventType, event: cg.CGEventRef) ?cg.CGEventRef {
+    // The system disables taps it considers unresponsive (heavy load, debugger
+    // pause, login window). Re-enable ours or remapping dies until restart.
+    if (event_type == cg.kCGEventTapDisabledByTimeout or event_type == cg.kCGEventTapDisabledByUserInput) {
+        std.debug.print("Event tap disabled by system, re-enabling\n", .{});
+        if (global_event_tap != null) cg.CGEventTapEnable(global_event_tap, true);
+        return event;
+    }
+
     // Pass through everything when remapping is disabled
     if (!global_enabled) return event;
 
     // Filter: only process events from built-in keyboard if enabled in config
     if (global_builtin_keyboard_only) {
         if (global_builtin_kb_type) |kb_type| {
-            const event_kb_type = c.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeyboardType);
+            const event_kb_type = cg.CGEventGetIntegerValueField(event, cg.kCGKeyboardEventKeyboardType);
             if (event_kb_type != kb_type) return event; // external keyboard, pass through
         }
         // if detection failed (null), fall through and process all keyboards
     }
     
-    const kcode: c.CGKeyCode = @intCast(c.CGEventGetIntegerValueField(event, c.kCGKeyboardEventKeycode));
+    const kcode: cg.CGKeyCode = @intCast(cg.CGEventGetIntegerValueField(event, cg.kCGKeyboardEventKeycode));
     const kcode_i64: i64 = @intCast(kcode);
 
-    // Pass through Space when real modifier keys are held (e.g., Cmd+Space for Spotlight)
+    // Pass through Space when Cmd/Ctrl are held (e.g., Cmd+Space for Spotlight,
+    // Ctrl+Space for input source switching). Option and Shift do NOT bypass the
+    // space layer, so e.g. Alt+Space+H emits Option+LeftArrow.
     if (kcode == 49) { // Space keycode
-        const flags: u64 = @intCast(c.CGEventGetFlags(event));
-        const real_mod_mask = keycode.kCGEventFlagMaskCommand | keycode.kCGEventFlagMaskControl | keycode.kCGEventFlagMaskAlternate;
+        const flags: u64 = @intCast(cg.CGEventGetFlags(event));
+        const real_mod_mask = keycode.kCGEventFlagMaskCommand | keycode.kCGEventFlagMaskControl;
         if (flags & real_mod_mask != 0) {
             return event;
         }
@@ -1056,16 +1189,16 @@ fn eventCallbackInternal(event_type: c.CGEventType, event: c.CGEventRef) ?c.CGEv
         if (key_opt) |from_key| {
             for (global_remapper.config.simple_remaps) |sr| {
                 if (sr.from == from_key) {
-                    if (event_type == c.kCGEventFlagsChanged) {
+                    if (event_type == cg.kCGEventFlagsChanged) {
                         // Modifier key remap: detect press/release via device-specific flags
-                        const flags: u64 = @intCast(c.CGEventGetFlags(event));
+                        const flags: u64 = @intCast(cg.CGEventGetFlags(event));
                         const is_pressed = keycode.isModifierPressed(kcode, flags);
                         if (is_pressed) {
                             std.debug.print("Simple remap: {s} pressed -> emitting {s} down\n", .{ @tagName(from_key), @tagName(sr.to) });
                             if (keycode.isModifierKey(sr.to)) {
                                 // Remap modifier to modifier: pass through with modified keycode
                                 const target_kcode = keycode.keyToKeycode(sr.to);
-                                c.CGEventSetIntegerValueField(event, c.kCGKeyboardEventKeycode, @intCast(target_kcode));
+                                cg.CGEventSetIntegerValueField(event, cg.kCGKeyboardEventKeycode, @intCast(target_kcode));
                                 return event;
                             } else {
                                 emitSyntheticKeyDown(sr.to, 0);
@@ -1074,30 +1207,30 @@ fn eventCallbackInternal(event_type: c.CGEventType, event: c.CGEventRef) ?c.CGEv
                             std.debug.print("Simple remap: {s} released -> emitting {s} up\n", .{ @tagName(from_key), @tagName(sr.to) });
                             if (keycode.isModifierKey(sr.to)) {
                                 const target_kcode = keycode.keyToKeycode(sr.to);
-                                c.CGEventSetIntegerValueField(event, c.kCGKeyboardEventKeycode, @intCast(target_kcode));
+                                cg.CGEventSetIntegerValueField(event, cg.kCGKeyboardEventKeycode, @intCast(target_kcode));
                                 return event;
                             } else {
                                 emitSyntheticKeyUp(sr.to, 0);
                             }
                         }
                         return null; // suppress original modifier event
-                    } else if (event_type == c.kCGEventKeyDown) {
+                    } else if (event_type == cg.kCGEventKeyDown) {
                         // Regular key remap
                         std.debug.print("Simple remap: {s} -> {s}\n", .{ @tagName(from_key), @tagName(sr.to) });
                         if (keycode.isModifierKey(sr.to)) {
                             // Remap regular key to modifier: would need flags changed event
                             // For now, just change the keycode
                             const target_kcode = keycode.keyToKeycode(sr.to);
-                            c.CGEventSetIntegerValueField(event, c.kCGKeyboardEventKeycode, @intCast(target_kcode));
+                            cg.CGEventSetIntegerValueField(event, cg.kCGKeyboardEventKeycode, @intCast(target_kcode));
                             return event;
                         } else {
                             const target_kcode = keycode.keyToKeycode(sr.to);
-                            c.CGEventSetIntegerValueField(event, c.kCGKeyboardEventKeycode, @intCast(target_kcode));
+                            cg.CGEventSetIntegerValueField(event, cg.kCGKeyboardEventKeycode, @intCast(target_kcode));
                             return event;
                         }
-                    } else if (event_type == c.kCGEventKeyUp) {
+                    } else if (event_type == cg.kCGEventKeyUp) {
                         const target_kcode = keycode.keyToKeycode(sr.to);
-                        c.CGEventSetIntegerValueField(event, c.kCGKeyboardEventKeycode, @intCast(target_kcode));
+                        cg.CGEventSetIntegerValueField(event, cg.kCGKeyboardEventKeycode, @intCast(target_kcode));
                         return event;
                     }
                 }
@@ -1105,35 +1238,33 @@ fn eventCallbackInternal(event_type: c.CGEventType, event: c.CGEventRef) ?c.CGEv
         }
     }
 
-    if (event_type == c.kCGEventKeyDown) {
+    if (event_type == cg.kCGEventKeyDown) {
         const action = global_remapper.handleKeyDown(kcode_i64) catch |err| {
             std.debug.print("Error handling key down: {}\n", .{err});
             return event;
         };
+        // Fast-roll taps must come out before the key that ended the roll.
+        for (global_remapper.takePendingRolls()) |roll_key| {
+            emitKeyOrMouse(roll_key, realModifierFlags(event));
+        }
         switch (action) {
             .Suppress => return null,
             .PassThrough => return event,
             .ReplaceWithKey => |key| {
-                emitKeyOrMouse(key, 0);
+                emitKeyOrMouse(key, realModifierFlags(event));
+                return null;
+            },
+            .ReplaceWithKeyAndModifiers => |data| {
+                emitKeyOrMouse(data.key, modifiersToFlags(data.modifiers) | realModifierFlags(event));
                 return null;
             },
             .ApplyModifiers => |mods| {
                 const flags = modifiersToFlags(mods);
-                c.CGEventSetFlags(event, flags);
-                return event;
-            },
-            .EmitPendingThenPassThrough => |key| {
-                emitKeyOrMouse(key, 0);
-                return event;
-            },
-            .EmitPendingThenApplyModifiers => |data| {
-                emitKeyOrMouse(data.pending_key, 0);
-                const flags = modifiersToFlags(data.modifiers);
-                c.CGEventSetFlags(event, flags);
+                cg.CGEventSetFlags(event, flags);
                 return event;
             },
         }
-    } else if (event_type == c.kCGEventKeyUp) {
+    } else if (event_type == cg.kCGEventKeyUp) {
         // Deactivate all mouse movement when space is released
         if (kcode == 0x31 and mouse_move_state.anyActive()) {
             deactivateAllMouseDirections();
@@ -1160,28 +1291,30 @@ fn eventCallbackInternal(event_type: c.CGEventType, event: c.CGEventRef) ?c.CGEv
             .Suppress => return null,
             .PassThrough => return event,
             .ReplaceWithKey => |key| {
-                emitKeyOrMouse(key, 0);
+                emitKeyOrMouse(key, realModifierFlags(event));
+                return null;
+            },
+            .ReplaceWithKeyAndModifiers => |data| {
+                emitKeyOrMouse(data.key, modifiersToFlags(data.modifiers) | realModifierFlags(event));
                 return null;
             },
             .ApplyModifiers => |mods| {
                 const flags = modifiersToFlags(mods);
-                c.CGEventSetFlags(event, flags);
-                return event;
-            },
-            .EmitPendingThenPassThrough => |key| {
-                emitKeyOrMouse(key, 0);
-                return event;
-            },
-            .EmitPendingThenApplyModifiers => |data| {
-                emitKeyOrMouse(data.pending_key, 0);
-                const flags = modifiersToFlags(data.modifiers);
-                c.CGEventSetFlags(event, flags);
+                cg.CGEventSetFlags(event, flags);
                 return event;
             },
         }
     }
 
     return event;
+}
+
+/// The real (physically held) modifier flags on an incoming event, masked to
+/// just Cmd/Opt/Ctrl/Shift so device-specific bits don't leak into synthetic events.
+fn realModifierFlags(event: cg.CGEventRef) keycode.CGEventFlags {
+    const flags: u64 = @intCast(cg.CGEventGetFlags(event));
+    const mask = keycode.kCGEventFlagMaskCommand | keycode.kCGEventFlagMaskAlternate | keycode.kCGEventFlagMaskControl | keycode.kCGEventFlagMaskShift;
+    return flags & mask;
 }
 
 fn modifiersToFlags(mods: []const config.Modifier) keycode.CGEventFlags {
@@ -1215,7 +1348,7 @@ fn activateMouseDirection(key: Key) void {
         else => return,
     }
     if (mouse_move_state.timer == null) {
-        mouse_move_state.start_time = std.time.nanoTimestamp();
+        mouse_move_state.start_time = remapper.nanoTimestamp();
         startMouseMoveTimer();
         std.debug.print("Mouse move timer started\n", .{});
     }
@@ -1245,7 +1378,7 @@ fn deactivateAllMouseDirections() void {
 fn mouseTimerCallback(_: c.CFRunLoopTimerRef, _: ?*anyopaque) callconv(.c) void {
     if (!mouse_move_state.anyActive()) return;
 
-    const now = std.time.nanoTimestamp();
+    const now = remapper.nanoTimestamp();
     const elapsed_ms: i64 = @intCast(@divTrunc(now - mouse_move_state.start_time, std.time.ns_per_ms));
 
     // Acceleration curve
@@ -1264,19 +1397,19 @@ fn mouseTimerCallback(_: c.CFRunLoopTimerRef, _: ?*anyopaque) callconv(.c) void 
     if (dx == 0 and dy == 0) return;
 
     // Get current cursor position
-    const dummy = c.CGEventCreate(null);
+    const dummy = cg.CGEventCreate(null);
     if (dummy == null) return;
-    const pos = c.CGEventGetLocation(dummy);
+    const pos = cg.CGEventGetLocation(dummy);
     c.CFRelease(dummy);
 
-    const new_pos = c.CGPoint{ .x = pos.x + dx, .y = pos.y + dy };
+    const new_pos = cg.CGPoint{ .x = pos.x + dx, .y = pos.y + dy };
 
-    const source = c.CGEventSourceCreate(c.kCGEventSourceStateHIDSystemState);
+    const source = cg.CGEventSourceCreate(cg.kCGEventSourceStateHIDSystemState);
     if (source == null) return;
 
-    const move_event = c.CGEventCreateMouseEvent(source, c.kCGEventMouseMoved, new_pos, c.kCGMouseButtonLeft);
+    const move_event = cg.CGEventCreateMouseEvent(source, cg.kCGEventMouseMoved, new_pos, cg.kCGMouseButtonLeft);
     if (move_event != null) {
-        c.CGEventPost(c.kCGSessionEventTap, move_event);
+        cg.CGEventPost(cg.kCGSessionEventTap, move_event);
         c.CFRelease(move_event);
     }
     c.CFRelease(source);
@@ -1309,26 +1442,26 @@ fn stopMouseMoveTimer() void {
 
 fn emitMouseClick(comptime button: enum { left, right }) void {
     // Get current mouse position
-    const dummy_event = c.CGEventCreate(null);
+    const dummy_event = cg.CGEventCreate(null);
     if (dummy_event == null) return;
-    const pos = c.CGEventGetLocation(dummy_event);
+    const pos = cg.CGEventGetLocation(dummy_event);
     c.CFRelease(dummy_event);
 
-    const source = c.CGEventSourceCreate(c.kCGEventSourceStateHIDSystemState);
+    const source = cg.CGEventSourceCreate(cg.kCGEventSourceStateHIDSystemState);
     if (source == null) return;
 
-    const down_type = if (button == .left) c.kCGEventLeftMouseDown else c.kCGEventRightMouseDown;
-    const up_type = if (button == .left) c.kCGEventLeftMouseUp else c.kCGEventRightMouseUp;
-    const cg_button = if (button == .left) c.kCGMouseButtonLeft else c.kCGMouseButtonRight;
+    const down_type = if (button == .left) cg.kCGEventLeftMouseDown else cg.kCGEventRightMouseDown;
+    const up_type = if (button == .left) cg.kCGEventLeftMouseUp else cg.kCGEventRightMouseUp;
+    const cg_button = if (button == .left) cg.kCGMouseButtonLeft else cg.kCGMouseButtonRight;
 
-    const down = c.CGEventCreateMouseEvent(source, down_type, pos, cg_button);
+    const down = cg.CGEventCreateMouseEvent(source, down_type, pos, cg_button);
     if (down != null) {
-        c.CGEventPost(c.kCGSessionEventTap, down);
+        cg.CGEventPost(cg.kCGSessionEventTap, down);
         c.CFRelease(down);
     }
-    const up = c.CGEventCreateMouseEvent(source, up_type, pos, cg_button);
+    const up = cg.CGEventCreateMouseEvent(source, up_type, pos, cg_button);
     if (up != null) {
-        c.CGEventPost(c.kCGSessionEventTap, up);
+        cg.CGEventPost(cg.kCGSessionEventTap, up);
         c.CFRelease(up);
     }
 
@@ -1352,16 +1485,16 @@ fn emitSyntheticKey(key: Key, modifiers: keycode.CGEventFlags) void {
 fn emitSyntheticKeyDown(key: Key, modifiers: keycode.CGEventFlags) void {
     const kcode = keycode.keyToKeycode(key);
 
-    const source = c.CGEventSourceCreate(c.kCGEventSourceStateHIDSystemState);
+    const source = cg.CGEventSourceCreate(cg.kCGEventSourceStateHIDSystemState);
     if (source == null) return;
 
-    const keydown = c.CGEventCreateKeyboardEvent(source, kcode, true);
+    const keydown = cg.CGEventCreateKeyboardEvent(source, kcode, true);
     if (keydown == null) {
         c.CFRelease(source);
         return;
     }
-    c.CGEventSetFlags(keydown, modifiers);
-    c.CGEventPost(c.kCGSessionEventTap, keydown);
+    cg.CGEventSetFlags(keydown, modifiers);
+    cg.CGEventPost(cg.kCGSessionEventTap, keydown);
     c.CFRelease(keydown);
 
     c.CFRelease(source);
@@ -1370,16 +1503,16 @@ fn emitSyntheticKeyDown(key: Key, modifiers: keycode.CGEventFlags) void {
 fn emitSyntheticKeyUp(key: Key, modifiers: keycode.CGEventFlags) void {
     const kcode = keycode.keyToKeycode(key);
 
-    const source = c.CGEventSourceCreate(c.kCGEventSourceStateHIDSystemState);
+    const source = cg.CGEventSourceCreate(cg.kCGEventSourceStateHIDSystemState);
     if (source == null) return;
 
-    const keyup = c.CGEventCreateKeyboardEvent(source, kcode, false);
+    const keyup = cg.CGEventCreateKeyboardEvent(source, kcode, false);
     if (keyup == null) {
         c.CFRelease(source);
         return;
     }
-    c.CGEventSetFlags(keyup, modifiers);
-    c.CGEventPost(c.kCGSessionEventTap, keyup);
+    cg.CGEventSetFlags(keyup, modifiers);
+    cg.CGEventPost(cg.kCGSessionEventTap, keyup);
     c.CFRelease(keyup);
 
     c.CFRelease(source);

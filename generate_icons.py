@@ -49,6 +49,15 @@ FONT = {
         0b10000,
         0b10000,
     ],
+    'd': [
+        0b00001,
+        0b00001,
+        0b01101,
+        0b10011,
+        0b10001,
+        0b10011,
+        0b01101,
+    ],
 }
 
 
@@ -200,37 +209,20 @@ def generate_app_icon(size):
 
 
 def generate_menubar_icon(size):
-    """Generate menu bar template icon — black shapes on transparent bg."""
+    """Menu bar template icon: one keycap with a lowercase 'd' punched out.
+
+    A single glyph stays readable at 18px, unlike the old four-keycap design.
+    """
     pixels = [(0, 0, 0, 0)] * (size * size)  # transparent
 
-    letters = ['A', 'S', 'D', 'F']
-    num_keys = 4
+    margin = max(2, size // 9)
+    key = size - 2 * margin
+    key_radius = max(2, key // 4)
+    draw_rounded_rect(pixels, size, margin, margin, key, key, key_radius, (0, 0, 0, 255))
 
-    padding = max(1, size // 6)
-    available = size - 2 * padding
-    gap = max(1, size // 12)
-    key_w = (available - (num_keys - 1) * gap) // num_keys
-    key_h = int(size * 0.65)
-    key_radius = max(1, key_w // 4)
-
-    y_start = (size - key_h) // 2
-    x_start = padding + (available - (num_keys * key_w + (num_keys - 1) * gap)) // 2
-
-    # Template images: use black with varying alpha
-    cap_color = (0, 0, 0, 200)
-    letter_color = (0, 0, 0, 0)  # "punch out" letters — transparent
-
-    font_scale = max(1, key_w // 7)
-
-    for i, letter in enumerate(letters):
-        kx = x_start + i * (key_w + gap)
-        draw_rounded_rect(pixels, size, kx, y_start, key_w, key_h, key_radius, cap_color)
-
-        # Draw letter as transparent (cut out from the keycap)
-        letter_cx = kx + key_w // 2
-        letter_cy = y_start + key_h // 2
-        if font_scale >= 1:
-            draw_letter(pixels, size, letter, letter_cx, letter_cy, font_scale, letter_color)
+    # Punch the 'd' out of the keycap (transparent letter), ~60% of cap height
+    font_scale = max(1, int(key * 0.6) // 7)
+    draw_letter(pixels, size, 'd', size // 2, size // 2, font_scale, (0, 0, 0, 0))
 
     return create_png(size, size, pixels)
 
