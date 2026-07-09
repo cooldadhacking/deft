@@ -38,6 +38,7 @@ pub const RemapperState = struct {
     config: Config,
     key_states: std.AutoHashMap(Key, KeyState),
     space_layer_active: bool,
+    space_layer_used: bool,
     active_modifiers: std.ArrayList(Modifier),
     allocator: std.mem.Allocator,
     active_profile: config.Profile,
@@ -51,6 +52,7 @@ pub const RemapperState = struct {
             .config = cfg,
             .key_states = std.AutoHashMap(Key, KeyState).init(allocator),
             .space_layer_active = false,
+            .space_layer_used = false,
             .active_modifiers = .empty,
             .allocator = allocator,
             .active_profile = .{},
@@ -158,6 +160,29 @@ pub const RemapperState = struct {
             }
         }
 
+        // --- Space roll guard: space pressed just before another key is a
+        // typed space, not a layer hold. Drop out of layer mode before chord
+        // and layer processing; the space tap is flushed further below so it
+        // lands after any home-row taps rolled by checkAndActivateChords.
+        var flush_space = false;
+        if (profile.space_layer and self.space_layer_active) {
+            if (key_opt) |k| {
+                if (k != .Space) {
+                    if (self.key_states.get(.Space)) |sstate| {
+                        if (sstate == .Down) {
+                            const elapsed_ms = @divTrunc(nanoTimestamp() - sstate.Down, std.time.ns_per_ms);
+                            if (elapsed_ms < self.config.timing.chord_ms) {
+                                std.debug.print("Space roll: down only {d}ms, flushing as tap\n", .{elapsed_ms});
+                                flush_space = true;
+                                self.space_layer_active = false;
+                                try self.key_states.put(.Space, .Tapped);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // --- Chord detection and modifier updates (only when tap_hold enabled) ---
         if (profile.tap_hold) {
             const is_incoming_home_row = if (key_opt) |k|
@@ -170,6 +195,11 @@ pub const RemapperState = struct {
             }
 
             try self.updateHeldModifiers();
+        }
+
+        if (flush_space and self.roll_len < self.roll_buf.len) {
+            self.roll_buf[self.roll_len] = .Space;
+            self.roll_len += 1;
         }
 
         if (key_opt) |k| {
@@ -188,6 +218,7 @@ pub const RemapperState = struct {
 
                     try self.key_states.put(.Space, .{ .Down = nanoTimestamp() });
                     self.space_layer_active = true;
+                    self.space_layer_used = false;
                     std.debug.print("Space layer activated\n", .{});
                     return .Suppress;
                 }
@@ -196,6 +227,7 @@ pub const RemapperState = struct {
                     for (self.config.space_layer) |mapping| {
                         if (k == mapping.from) {
                             std.debug.print("Space layer mapping: {s} -> {s} (modifiers: {any})\n", .{ @tagName(k), @tagName(mapping.to), self.active_modifiers.items });
+                            self.space_layer_used = true;
                             return .{ .ReplaceWithKeyAndModifiers = .{ .key = mapping.to, .modifiers = self.active_modifiers.items } };
                         }
                     }
@@ -299,9 +331,11 @@ pub const RemapperState = struct {
                 if (state == .Down) {
                     const elapsed_ns = nanoTimestamp() - state.Down;
                     const elapsed_ms = @divTrunc(elapsed_ns, std.time.ns_per_ms);
-                    std.debug.print("Space held for {d}ms\n", .{elapsed_ms});
+                    std.debug.print("Space held for {d}ms (layer used: {})\n", .{ elapsed_ms, self.space_layer_used });
 
-                    if (elapsed_ms < self.config.timing.tap_ms) {
+                    // A held space that never triggered a layer key was still
+                    // a space press — emit it even past tap_ms.
+                    if (elapsed_ms < self.config.timing.tap_ms or !self.space_layer_used) {
                         try self.key_states.put(key, .Tapped);
                         return .{ .ReplaceWithKey = .Space };
                     }
